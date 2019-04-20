@@ -1,0 +1,651 @@
+---
+title: "Case_2_study"
+author: "Yongjun Chu"
+date: "April 19, 2019"
+output: html_document
+---
+#Introduction 
+##As a data science team, we are interested in identifying key factors that contributed to the departure of employees in our company. To to that, we attempted to apply three different classification models to the data we have collented in our company, Naive Bayes, Logistic regression, and XGBoost. Additionally, we want to investigate wnat factors are closely associated with salaey by using meltiple linear regression and LASSO. 
+
+## Useful functions when working with logistic regression
+```{r}
+#rm(list = ls())
+library(ROCR)
+library(grid)
+library(caret)
+library(dplyr)
+library(scales)
+library(ggplot2)
+library(gridExtra)
+library(data.table)
+
+# ------------------------------------------------------------------------------------------
+# [AccuracyCutoffInfo] : 
+
+AccuracyCutoffInfo <- function( train, test, predict, actual )
+{
+  # change the cutoff value's range as you please 
+  cutoff <- seq( .4, .8, by = .05 )
+  
+  accuracy <- lapply( cutoff, function(c)
+  {
+    # use the confusionMatrix from the caret package
+    cm_train <- confusionMatrix( as.numeric( train[[predict]] > c ), train[[actual]] )
+    cm_test  <- confusionMatrix( as.numeric( test[[predict]]  > c ), test[[actual]]  )
+    
+    dt <- data.table( cutoff = c,
+                      train  = cm_train$overall[["Accuracy"]],
+                      test   = cm_test$overall[["Accuracy"]] )
+    return(dt)
+  }) %>% rbindlist()
+  
+  # visualize the accuracy of the train and test set for different cutoff value 
+  # accuracy in percentage.
+  accuracy_long <- gather( accuracy, "data", "accuracy", -1 )
+  
+  plot <- ggplot( accuracy_long, aes( cutoff, accuracy, group = data, color = data ) ) + 
+    geom_line( size = 1 ) + geom_point( size = 3 ) +
+    scale_y_continuous( label = percent ) +
+    ggtitle( "Train/Test Accuracy for Different Cutoff" )
+  
+  return( list( data = accuracy, plot = plot ) )
+}
+
+
+# ------------------------------------------------------------------------------------------
+# [ConfusionMatrixInfo] : 
+
+ConfusionMatrixInfo <- function( data, predict, actual, cutoff )
+{	
+  # extract the column ;
+  # relevel making 1 appears on the more commonly seen position in 
+  # a two by two confusion matrix	
+  predict <- data[[predict]]
+  actual  <- relevel( as.factor( data[[actual]] ), "1" )
+  
+  result <- data.table( actual = actual, predict = predict )
+  
+  # caculating each pred falls into which category for the confusion matrix
+  result[ , type := ifelse( predict >= cutoff & actual == 1, "TP",
+                            ifelse( predict >= cutoff & actual == 0, "FP", 
+                                    ifelse( predict <  cutoff & actual == 1, "FN", "TN" ) ) ) %>% as.factor() ]
+  
+  # jittering : can spread the points along the x axis 
+  plot <- ggplot( result, aes( actual, predict, color = type ) ) + 
+    geom_violin( fill = "white", color = NA ) +
+    geom_jitter( shape = 1 ) + 
+    geom_hline( yintercept = cutoff, color = "blue", alpha = 0.6 ) + 
+    scale_y_continuous( limits = c( 0, 1 ) ) + 
+    scale_color_discrete( breaks = c( "TP", "FN", "FP", "TN" ) ) + # ordering of the legend 
+    guides( col = guide_legend( nrow = 2 ) ) + # adjust the legend to have two rows  
+    ggtitle( sprintf( "Confusion Matrix with Cutoff at %.2f", cutoff ) )
+  
+  return( list( data = result, plot = plot ) )
+}
+
+
+# ------------------------------------------------------------------------------------------
+# [ROCInfo] : 
+
+ROCInfo <- function( data, predict, actual, cost.fp, cost.fn )
+{
+  # calculate the values using the ROCR library
+  # true positive, false postive 
+  pred <- prediction( data[[predict]], data[[actual]] )
+  perf <- performance( pred, "tpr", "fpr" )
+  roc_dt <- data.frame( fpr = perf@x.values[[1]], tpr = perf@y.values[[1]] )
+  
+  # cost with the specified false positive and false negative cost 
+  # false postive rate * number of negative instances * false positive cost + 
+  # false negative rate * number of positive instances * false negative cost
+  cost <- perf@x.values[[1]] * cost.fp * sum( data[[actual]] == 0 ) + 
+    ( 1 - perf@y.values[[1]] ) * cost.fn * sum( data[[actual]] == 1 )
+  
+  cost_dt <- data.frame( cutoff = pred@cutoffs[[1]], cost = cost )
+  
+  # optimal cutoff value, and the corresponding true positive and false positive rate
+  best_index  <- which.min(cost)
+  best_cost   <- cost_dt[ best_index, "cost" ]
+  best_tpr    <- roc_dt[ best_index, "tpr" ]
+  best_fpr    <- roc_dt[ best_index, "fpr" ]
+  best_cutoff <- pred@cutoffs[[1]][ best_index ]
+  
+  # area under the curve
+  auc <- performance( pred, "auc" )@y.values[[1]]
+  
+  # normalize the cost to assign colors to 1
+  normalize <- function(v) ( v - min(v) ) / diff( range(v) )
+  
+  # create color from a palette to assign to the 100 generated threshold between 0 ~ 1
+  # then normalize each cost and assign colors to it, the higher the blacker
+  # don't times it by 100, there will be 0 in the vector
+  col_ramp <- colorRampPalette( c( "green", "orange", "red", "black" ) )(100)   
+  col_by_cost <- col_ramp[ ceiling( normalize(cost) * 99 ) + 1 ]
+  
+  roc_plot <- ggplot( roc_dt, aes( fpr, tpr ) ) + 
+    geom_line( color = rgb( 0, 0, 1, alpha = 0.3 ) ) +
+    geom_point( color = col_by_cost, size = 4, alpha = 0.2 ) + 
+    geom_segment( aes( x = 0, y = 0, xend = 1, yend = 1 ), alpha = 0.8, color = "royalblue" ) + 
+    labs( title = "ROC", x = "False Postive Rate", y = "True Positive Rate" ) +
+    geom_hline( yintercept = best_tpr, alpha = 0.8, linetype = "dashed", color = "steelblue4" ) +
+    geom_vline( xintercept = best_fpr, alpha = 0.8, linetype = "dashed", color = "steelblue4" )				
+  
+  cost_plot <- ggplot( cost_dt, aes( cutoff, cost ) ) +
+    geom_line( color = "blue", alpha = 0.5 ) +
+    geom_point( color = col_by_cost, size = 4, alpha = 0.5 ) +
+    ggtitle( "Cost" ) +
+    scale_y_continuous( labels = comma ) +
+    geom_vline( xintercept = best_cutoff, alpha = 0.8, linetype = "dashed", color = "steelblue4" )	
+  
+  # the main title for the two arranged plot
+  sub_title <- sprintf( "Cutoff at %.2f - Total Cost = %d, AUC = %.3f", 
+                        best_cutoff, best_cost, auc )
+  
+  # arranged into a side by side plot
+  plot <- arrangeGrob( roc_plot, cost_plot, ncol = 2, 
+                       top = textGrob( sub_title, gp = gpar( fontsize = 16, fontface = "bold" ) ) )
+  
+  return( list( plot 		  = plot, 
+                cutoff 	  = best_cutoff, 
+                totalcost   = best_cost, 
+                auc         = auc,
+                sensitivity = best_tpr, 
+                specificity = 1 - best_fpr ) )
+}
+#--------------------------------------------------------------------
+```
+
+## environment setting 
+```{r}
+#devtools::install_github('cttobin/ggthemr')
+library(ROCR)
+library(grid)
+library(broom)
+library(caret)
+library(tidyr)
+library(dplyr)
+library(scales)
+library(ggplot2)
+library(ggthemr) 
+library(ggthemes)
+library(gridExtra)
+library(data.table)
+library(corrplot)
+library(caTools)
+library(MASS)
+library(dplyr)
+library(ggplot2)
+library(Amelia)
+library(MASS)
+library(plyr)
+library(corrgram)
+library(PerformanceAnalytics)
+
+#load files
+setwd("C:\\Users\\chu001\\Documents\\Yongjun-Chu files\\SMU-data-science-application\\Doing-Data_Science\\Case_study_2")
+test_att <- read.csv("C:\\Users\\chu001\\Documents\\Yongjun-Chu files\\SMU-data-science-application\\Doing-Data_Science\\Case_study_2\\CaseStudy2Validation_No_Attrition.csv", header=T)
+test_salary <- read.csv("C:\\Users\\chu001\\Documents\\Yongjun-Chu files\\SMU-data-science-application\\Doing-Data_Science\\Case_study_2\\CaseStudy2Validation_ No_Salary.csv", header=T)
+case <- read.csv("C:\\Users\\chu001\\Documents\\Yongjun-Chu files\\SMU-data-science-application\\Doing-Data_Science\\Case_study_2\\CaseStudy2-data.csv", header=T)
+
+case1=case
+str(case1)
+dim(case1)
+
+#check how many NAs
+#convert all empty or space entries to NA
+case1[case1 == "" | case1 == " "] <- NA
+sapply(case1, function(x) sum(is.na(x)))
+sum(is.na(case1))
+
+#remove "Over18" "StandardHours" "EmployeeCount" and "ID" since they have only one level or unrelated values
+case1$Over18 <- NULL
+case1$StandardHours <- NULL
+case1$EmployeeCount <- NULL
+rownames(case1)= case1$ID
+case1$ID <- NULL
+str(case1)
+head(case1)
+
+#plot cooreltion matrix
+#case1[, sapply(case1, is.factor) & colnames(case1) != "id"]
+corr <- cor(case1[,c(1,4,6,7,9,10,12:14,16,18:20,22:33)])
+col<- colorRampPalette(c("red", "white", "blue"))(20)
+corrplot(corr, type="upper", order="hclust", col=col, tl.cex = 0.8)
+corrplot(corr, method="number",tl.cex = 0.8)
+
+# find correlations to tht have high correlation coefficients 
+findCorrelation( cor(case1[,c(1,4,6,7,9,10,12:14,16,18:20,22:33)]), cutoff = .75, names = TRUE )
+
+```
+
+
+##Logistic regression model for classification
+
+```{r}
+#change Attrition into numeric for 2 levels for logistic regression
+case1$Attrition <- as.character(case1$Attrition)
+case1$Attrition <- as.numeric(ifelse(case1$Attrition == "Yes", 1, 0 ))
+class(case1$Attrition )
+
+# from this probability table we can see that 16 percent of emplyees have left
+prop.table( table(case1$Attrition) )
+
+#input data partition
+#set.seed(123)
+#split = sample.split(case1$Attrition, SplitRatio = 0.80)#
+#data_train = subset(case1, split == TRUE)
+#data_test = subset(case1, split == FALSE)
+
+data=case1
+set.seed(4321)
+test <- createDataPartition( data$Attrition, p = .2, list = FALSE )
+data_train <- data[ -test, ]
+data_test  <- data[ test, ]
+rm(data)
+
+str(data_train)
+head(data_train)
+dim(data_train)
+dim(data_test)
+table(data_train$Attrition)
+table(data_test$Attrition)
+
+
+# fit Full logistic Model
+Total <- glm(formula = Attrition ~., data = data_train, family = binomial(logit))
+summary(Total)
+# using stepwie Model
+Stepwise <- stepAIC(Total,trace = FALSE)
+# setpwise model
+Stepwise$anova
+summary(Stepwise)
+
+#model_glm <- glm( left ~ . , data = data_train, family = binomial(logit) )
+summary_glm <-summary(Stepwise)
+
+# pseudo r squared 
+list( Stepwise$Coefficients, 
+      1- ( 379.81 / 604.13 ) )
+
+data_train$prediction <- predict( Stepwise, newdata = data_train, type = "response" )
+data_test$prediction  <- predict( Stepwise, newdata = data_test , type = "response" )
+
+#plot the density distribution of 1 and 0 for Attrition n training dataset
+ggplot( data_train, aes( prediction, color = as.factor(Attrition) ) ) + 
+  geom_density( size = 1 ) +
+  ggtitle( "Training Set's Predicted Score" ) + 
+  scale_color_economist( name = "data", labels = c( "negative", "positive" ) ) + 
+  theme_economist()
+
+#the plot of TP, TN, FP and FN with cutoff rate of 0.5 in test dataset
+cm_info <- ConfusionMatrixInfo( data = data_test, predict = "prediction", 
+                                actual = "Attrition", cutoff = .5 )
+ggthemr("flat")
+cm_info$plot
+
+print(cm_info$data)
+
+#find the best cufoff rate (0.29) based on the cost 
+ggthemr_reset()
+# different cost for false negative and false positive 
+cost_fp <- 100
+cost_fn <- 200
+roc_info <- ROCInfo( data = cm_info$data, predict = "predict", 
+                     actual = "actual", cost.fp = cost_fp, cost.fn = cost_fn )
+
+# reset to default ggplot theme 
+grid.draw(roc_info$plot)
+
+
+# re-plot the confusion matrix plot 
+cm_info <- ConfusionMatrixInfo( data = data_test, predict = "prediction", 
+                                actual = "Attrition", cutoff = roc_info$cutoff )
+ggthemr("flat")
+cm_info$plot
+
+# Predict Attrition using stepwise model on Train
+Predict_stepwise <- predict(Stepwise, newdata=data_train, type='response')
+step_pred <- ifelse(Predict_stepwise > 0.29, 1, 0)
+step <- data.frame(Predict_stepwise, step_pred, data_train$Attrition)
+colnames(step)[3] <- "obs"
+head(step)
+str(step)
+step$step_pred <- as.factor(step$step_pred)
+step$obs <- as.factor(step$obs)
+confusionMatrix(step$step_pred, step$obs, positive = "1", dnn = c("Prediction", "Reference"))
+
+
+# Predict Attrition using stepwise model on Test
+Predict_stepwise <- predict(Stepwise, newdata=data_test, type='response')
+step_pred <- ifelse(Predict_stepwise >= 0.29, 1, 0)
+step <- data.frame(Predict_stepwise, step_pred, data_test$Attrition)
+colnames(step)[3] <- "obs"
+head(step)
+str(step)
+step$step_pred <- as.factor(step$step_pred)
+step$obs <- as.factor(step$obs)
+confusionMatrix(step$step_pred, step$obs, positive = "1", dnn = c("Prediction", "Reference"))
+
+#generate the required file for test_att
+Predict_test_att <- predict(Stepwise, newdata=test_att, type='response')
+test_att$pred <- ifelse(Predict_test_att >= 0.29, 1, 0)
+table(test_att$pred)
+test_att$pred_Attrition <- ifelse(test_att$pred ==1, "Yes", "No")
+table(test_att$pred_Attrition)
+final_att <- data.frame(test_att$ID, test_att$pred_Attrition)
+head(final_att)
+str(final_att)
+colnames(final_att) <- c("ID", "Attrition_pred")
+write.csv(final_att, "Case2PredictionsChu Attrition_1.csv", row.names = F)
+```
+
+##XGBoost for classification
+
+```{r}
+#install.packages("xgboost")
+library(xgboost)
+library(magrittr)
+library(dplyr)
+library(Matrix)
+
+data_train$prediction <- NULL
+data_test$prediction <- NULL
+
+#move "Attrition" to the first column
+str(data_train)
+data_train_new <- data.frame(data_train$Attrition, data_train[,-2])
+colnames(data_train_new)[1] <- "Attrition"
+str(data_train_new)
+data_test_new <- data.frame(data_test$Attrition, data_test[,-2])
+colnames(data_test_new)[1] <- "Attrition"
+str(data_test_new)
+
+#Create matrix-One_Hot ncoding for Factor variables
+trainm <- sparse.model.matrix(Attrition ~ .-1, data=data_train_new)
+head(trainm)
+train_label <- data_train_new[, "Attrition"]
+train_matrix <- xgb.DMatrix(data=as.matrix(trainm), label=train_label)
+testm <- sparse.model.matrix(Attrition ~ .-1, data=data_test_new)
+test_label <- data_test_new[, "Attrition"]
+test_matrix <- xgb.DMatrix(data=as.matrix(testm), label=test_label)
+
+#parameters
+nc=length(unique(train_label))
+xgb_params <- list("objective" = "multi:softprob", "eval_metric"="mlogloss",
+                   "num_class"=nc)
+watchlist <- list(train=train_matrix, test=test_matrix)
+#XGBoost model
+bst_model <- xgb.train(params = xgb_params, data=train_matrix, nrounds=100, 
+                       watchlist = watchlist, eta=0.01, max.depth=3, seed=333)
+#train and test error plot
+e<- data.frame(bst_model$evaluation_log)
+plot(e$iter, e$train_mlogloss, col="blue")
+lines(e$iter, e$test_mlogloss, col="red")
+
+#feature importance
+imp <- xgb.importance(colnames(train_matrix), model = bst_model)
+print(imp)
+xgb.plot.importance(imp, cex=1.0,left_margin = 15, xlim=c(0, 0.25) )
+
+#prediction and confusion matrix --test data
+p <- predict(bst_model, newdata =test_matrix )
+head(p)
+pred <- matrix(p, nrow=nc, ncol=length(p)/nc) %>%
+  t() %>% data.frame() %>% mutate(label = test_label) #, max_prob = max.col(., 'last')-1)
+head(pred)
+
+data_test$prediction  <- pred[,2]
+
+ggplot( data_test, aes( prediction, color = as.factor(Attrition) ) ) + 
+  geom_density( size = 1 ) +
+  ggtitle( "Testing Set's Predicted Score" ) + 
+  scale_color_economist( name = "data", labels = c( "negative", "positive" ) ) + 
+  theme_economist()
+
+#the plot of TP, TN, FP and FN with cutoff rate of 0.5 in test dataset
+cm_info <- ConfusionMatrixInfo( data = data_test, predict = "prediction", 
+                                actual = "Attrition", cutoff = .5 )
+ggthemr("flat")
+cm_info$plot
+
+print(cm_info$data)
+
+#find the best cufoff rate based on the cost 
+ggthemr_reset()
+# different cost for false negative and false positive 
+cost_fp <- 100
+cost_fn <- 200
+roc_info <- ROCInfo( data = cm_info$data, predict = "predict", 
+                     actual = "actual", cost.fp = cost_fp, cost.fn = cost_fn )
+
+# reset to default ggplot theme 
+grid.draw(roc_info$plot)
+#the cut_off value was 0.40
+
+#using cutoff value of 0.40 to determine confusion matrix with test dataset
+pred$predict <- ifelse(pred$X2 > 0.4, 1, 0)
+pred[,3] <- as.factor(pred[,3])
+pred[,4] <- as.factor(pred[,4])
+confusionMatrix(pred[,4], pred[,3], positive = "1", dnn = c("Prediction", "Reference"))
+
+#using cutoff value of 0.4 to determine the training dataset
+p <- predict(bst_model, newdata =train_matrix )
+head(p)
+pred <- matrix(p, nrow=nc, ncol=length(p)/nc) %>%
+  t() %>% data.frame() %>% mutate(label = train_label) #, max_prob = max.col(., 'last')-1)
+head(pred)
+
+pred$predict <- ifelse(pred$X2 > 0.4, 1, 0)
+pred[,3] <- as.factor(pred[,3])
+pred[,4] <- as.factor(pred[,4])
+confusionMatrix(pred[,4], pred[,3], positive = "1", dnn = c("Prediction", "Reference"))
+```
+
+
+##Naive Bayes for classification
+
+```{r}
+#change Attrition into factor for 2 levels for Naive Bayes regression
+str(case1)
+case1$Attrition <- as.character(case1$Attrition)
+case1$Attrition <- as.factor(case1$Attrition)
+class(case1$Attrition )
+
+
+# from this probability table we can see that 16 percent of emplyees have left
+prop.table( table(case1$Attrition) )
+
+#data partition
+set.seed(123)
+split = sample.split(case1$Attrition, SplitRatio = 0.80)
+Train = subset(case1, split == TRUE)
+Test = subset(case1, split == FALSE)
+head(Train)
+dim(Train)
+dim(Test)
+table(Train$Attrition)
+table(Test$Attrition)
+
+
+#install.packages("naivebayes")
+library(naivebayes)
+library(dplyr)
+library(ggplot2)
+library(psych)
+
+NB_train = Train
+NB_test = Test
+
+#fit the maodel and generate some intereting plots: plot(model_plot)
+model_plot <- naive_bayes(Attrition ~., data=NB_train )
+#model
+#plot(model_plot)
+
+library(e1071)
+model = naiveBayes(Attrition~.,data = NB_train)
+model
+
+#check on NB_test
+p_test <- predict(model,NB_test, type="raw")
+p2 <- cbind(p_test, NB_test)
+head(p2)
+colnames(p2)[1] <- "No" 
+colnames(p2)[2] <- "Yes"
+
+#find the best cufoff rate for test dataset (it was determined to be 0.68)
+NB_test$prediction  <- p2[,2]
+head(NB_test)
+ggplot(NB_test, aes( prediction, color = as.factor(Attrition) ) ) + 
+  geom_density( size = 1 ) +
+  ggtitle( "Testing Set's Predicted Score" ) + 
+  scale_color_economist( name = "data", labels = c( "negative", "positive" ) ) + 
+  theme_economist()
+
+cm_info <- ConfusionMatrixInfo( data = NB_test, predict = "prediction", 
+                                actual = "Attrition", cutoff = .5 )
+ggthemr("flat")
+cm_info$plot
+
+print(cm_info$data)
+
+ggthemr_reset()
+# different cost for false negative and false positive 
+cost_fp <- 100
+cost_fn <- 200
+roc_info <- ROCInfo( data = cm_info$data, predict = "predict", 
+                     actual = "actual", cost.fp = cost_fp, cost.fn = cost_fn )
+
+# reset to default ggplot theme 
+grid.draw(roc_info$plot)
+
+#get the confusion matrix for test dataset (it was determined to be 0.75)
+p2$pred <- ifelse(p2$Yes > 0.5, 1, 0)
+p2$pred <- as.factor(p2$pred)
+p2$obs <- as.factor(p2$Attrition)
+confusionMatrix(p2$pred, p2$obs, positive = "1", dnn = c("Prediction", "Reference"))
+
+#check on Train dataset
+p <- predict(model,NB_train, type="raw")
+p1 <- cbind(p, NB_train)
+head(p1)
+colnames(p1)[1] <- "No" 
+colnames(p1)[2] <- "Yes"
+p1$pred <- ifelse(p1$Yes > 0.5, 1, 0)
+p1$pred <- as.factor(p1$pred)
+p1$obs <- as.factor(p1$Attrition)
+confusionMatrix(p1$pred, p1$obs, positive = "1", dnn = c("Prediction", "Reference"))
+```
+
+##multiple linear regression and LASSO for MonthlyIncome prediction
+
+```{r}
+library(ggplot2)
+library(ggthemes)
+library(dplyr)
+library(caret)
+library(corrplot)
+library(corrgram)
+library(PerformanceAnalytics) 
+library(tidyverse)
+#install.packages("leaps") # data manipulation and visualization 
+library(leaps)      # model selection functions 
+
+#remove "Over18" "StandardHours" "EmployeeCount" and "ID" since they have only one level or unrelated values
+case2 = case
+case2$Over18 <- NULL
+case2$StandardHours <- NULL
+case2$EmployeeCount <- NULL
+rownames(case2)= case2$ID
+case2$ID <- NULL
+str(case2)
+
+hist(case2$MonthlyIncome, col="blue", main="Histogram of MonthlyIncome" )
+case2$logMonthlyIn <- log(case2$MonthlyIncome)
+hist(case2$logMonthlyIn, col="red", main="Histogram of log(MonthlyIncome)")
+case2$MonthlyIncome = NULL
+str(case2)
+
+set.seed(4321)
+test <- createDataPartition( case2$logMonthlyIn, p = .2, list = FALSE )
+data_train <- case2[ -test, ]
+data_test  <- case2[ test, ]
+
+#stepwise variable selections
+library(olsrr)
+model <- logMonthlyIn ~.
+fit <- lm(model, data_train)
+#test <- ols_step_all_possible(fit)
+#plot(test)
+result <- ols_step_both_p(fit, pent = 0.1, prem = 0.1, details = F)
+
+#reduced model based on stepwise variable selection
+reduced <- logMonthlyIn ~ JobLevel+JobRole+ TotalWorkingYears+ YearsInCurrentRole+EnvironmentSatisfaction +
+    NumCompaniesWorked +Attrition + BusinessTravel
+reduced_fit <- lm(reduced, data_train)
+
+p1 <- predict(reduced_fit, data_train)
+p1
+sqrt(mean((data_train$logMonthlyIn - p1)^2))
+p2 <- predict(reduced_fit, data_test)
+p2
+sqrt(mean((data_test$logMonthlyIn - p2)^2))
+
+
+#lm and lasso regressions
+#install.packages("mlbench")
+library(mlbench)
+library(psych)
+library(caret)
+library(glmnet)
+
+custom <- trainControl(method="repeatedcv", number=10, repeats=5,
+                       verboseIter = T)
+set.seed(1234)
+lm <- train(logMonthlyIn ~., data_train, method ='lm', trControl = custom)
+lm
+summary(lm)
+plot(lm$finalModel)
+
+set.seed(1234)
+lasso <- train(logMonthlyIn ~., data_train, method ='glmnet', tuneGrid = expand.grid(alpha=1,
+                                    lambda=seq(0.0001, 1, length=5)), trControl = custom)
+#plot results
+plot(lasso)
+lasso
+plot(varImp(lasso, scale=T), cex=1.0)
+
+#compare model
+model_list <- list(LinearModel=lm, LASSO=lasso )
+res <- resamples(model_list)
+summary(res)
+xyplot(res, metric = "RMSE")
+
+p3 <- predict(lm, data_train)
+p3
+sqrt(mean((data_train$logMonthlyIn - p3)^2))
+
+p4 <- predict(lm, data_test)
+p4
+sqrt(mean((data_test$logMonthlyIn - p4)^2))
+
+p5 <- predict(lasso, data_train)
+p5
+sqrt(mean((data_train$logMonthlyIn - p5)^2))
+
+#get the prediction for the data from Dr. Sadler
+str(test_salary$Attrition)
+p4 <- predict(lm, test_salary)
+p4
+test_salary$MonthlyIncome_pred <- exp(p4)
+str(test_salary)
+final <- data.frame(test_salary$ID, test_salary$MonthlyIncome_pred)
+head(final)
+colnames(final) <- c("ID", "MonthlyIncome_pred")
+write.csv(final, "Case2PredictionsChu Salary_1.csv", row.names = F)
+```
+
+#Summary
+##Classification study revealed that logistic regression model out-performed Naive Bayes and XGBoost models. The top three factors that contributed to the attrition of employees are: overtime_yes, MaritalStatus_single and YearsSinceLastPromotion. The analysis results will greatly help our company to retain talent that we can't afford to lose. For employee salary, JobLevel, JobRole and TotalWorkingYears are top three key relevent factors. 
+
+#The link to my presentatoin: https://www.screencast.com/t/KZXg90yAe
+
